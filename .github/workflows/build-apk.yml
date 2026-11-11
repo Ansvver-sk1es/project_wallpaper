@@ -1,0 +1,113 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # ใช้ตอนแนบไฟล์ APK เข้า GitHub Release (เฉพาะตอน push tag)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # ถ้าตั้ง secrets เหล่านี้ไว้ จะได้ APK ที่เซ็นชื่อเองสำหรับแจกจ่ายด้วย (ไม่ตั้งก็ได้)
+      KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle (cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install npm packages
+        run: npm install
+
+      - name: Generate app icons (ข้ามอัตโนมัติถ้าไม่มี assets/icon-only.png)
+        if: hashFiles('assets/icon-only.png') != ''
+        continue-on-error: true
+        run: |
+          npx cap add android
+          npx capacitor-assets generate --android \
+            --iconBackgroundColor '#15171f' --iconBackgroundColorDark '#15171f'
+
+      - name: Add Android platform
+        run: |
+          if [ ! -d android ]; then npx cap add android; fi
+
+      - name: Sync web files + plugins
+        run: npx cap sync android
+
+      - name: Set version code from run number
+        run: |
+          sed -i "s/versionCode [0-9]*/versionCode ${{ github.run_number }}/" android/app/build.gradle
+          grep -n "versionCode\|versionName" android/app/build.gradle || true
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WallpaperStudio-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      # ---------- (ไม่บังคับ) APK เซ็นชื่อด้วยคีย์ของคุณเอง ----------
+      - name: Build + sign release APK
+        if: env.KEYSTORE_B64 != ''
+        working-directory: android
+        run: |
+          ./gradlew assembleRelease --no-daemon
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          UNSIGNED=app/build/outputs/apk/release/app-release-unsigned.apk
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --out "$GITHUB_WORKSPACE/WallpaperStudio-release.apk" \
+            "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify "$GITHUB_WORKSPACE/WallpaperStudio-release.apk"
+
+      - name: Upload signed release APK
+        if: env.KEYSTORE_B64 != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: WallpaperStudio-release-apk
+          path: WallpaperStudio-release.apk
+
+      # ---------- แนบ APK เข้า GitHub Release เมื่อ push tag เช่น v1.0.0 ----------
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            WallpaperStudio-release.apk
